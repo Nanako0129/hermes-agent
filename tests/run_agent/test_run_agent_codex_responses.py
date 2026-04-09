@@ -258,11 +258,40 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert kwargs["store"] is False
     assert kwargs["tool_choice"] == "auto"
     assert kwargs["parallel_tool_calls"] is True
-    assert isinstance(kwargs["prompt_cache_key"], str)
-    assert len(kwargs["prompt_cache_key"]) > 0
+    assert "prompt_cache_key" not in kwargs
+    assert "prompt_cache_retention" not in kwargs
     assert "timeout" not in kwargs
     assert "max_tokens" not in kwargs
+    assert "max_output_tokens" not in kwargs
     assert "extra_body" not in kwargs
+
+
+def test_build_api_kwargs_codex_direct_openai_keeps_cache_key(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        base_url="https://api.openai.com/v1",
+        api_key="openai-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+
+    assert isinstance(kwargs["prompt_cache_key"], str)
+    assert len(kwargs["prompt_cache_key"]) > 0
+    assert "prompt_cache_retention" not in kwargs
+
+
+def test_build_api_kwargs_codex_chatgpt_backend_omits_max_output_tokens(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.max_tokens = 4096
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+
+    assert "max_output_tokens" not in kwargs
 
 
 def test_build_api_kwargs_copilot_responses_omits_openai_only_fields(monkeypatch):
@@ -640,12 +669,14 @@ def test_preflight_codex_api_kwargs_allows_reasoning_and_temperature(monkeypatch
     kwargs["include"] = ["reasoning.encrypted_content"]
     kwargs["temperature"] = 0.7
     kwargs["max_output_tokens"] = 4096
+    kwargs["prompt_cache_retention"] = "24h"
 
     result = agent._preflight_codex_api_kwargs(kwargs)
     assert result["reasoning"] == {"effort": "high", "summary": "auto"}
     assert result["include"] == ["reasoning.encrypted_content"]
     assert result["temperature"] == 0.7
     assert result["max_output_tokens"] == 4096
+    assert result["prompt_cache_retention"] == "24h"
 
 
 def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):

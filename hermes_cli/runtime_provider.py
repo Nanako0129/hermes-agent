@@ -262,11 +262,15 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         return None
     if not requested_norm.startswith("custom:"):
         try:
-            auth_mod.resolve_provider(requested_norm)
+            resolved = auth_mod.resolve_provider(requested_norm)
         except AuthError:
             pass
         else:
-            return None
+            # Local aliases like "lmstudio" / "ollama" resolve to the generic
+            # "custom" provider in auth.py, but users still expect the raw
+            # provider name to match a named custom provider in config.yaml.
+            if resolved != "custom":
+                return None
 
     config = load_config()
     custom_providers = config.get("custom_providers")
@@ -295,6 +299,14 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
         }
+        # Optional key_env from top-level providers.<name>.key_env
+        providers_cfg = config.get("providers")
+        if isinstance(providers_cfg, dict):
+            p_entry = providers_cfg.get(name_norm) or providers_cfg.get(name.strip())
+            if isinstance(p_entry, dict):
+                key_env = p_entry.get("key_env")
+                if isinstance(key_env, str) and key_env.strip():
+                    result["key_env"] = key_env.strip()
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
@@ -328,6 +340,11 @@ def _resolve_named_custom_runtime(
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
+        os.getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
+        os.getenv(
+            f"{_normalize_custom_provider_name(str(custom_provider.get('name', '') or '')).upper().replace('-', '_')}_API_KEY",
+            "",
+        ).strip(),
         os.getenv("OPENAI_API_KEY", "").strip(),
         os.getenv("OPENROUTER_API_KEY", "").strip(),
     ]

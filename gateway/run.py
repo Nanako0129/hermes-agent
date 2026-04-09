@@ -3075,11 +3075,15 @@ class GatewayRunner:
                         )
             
             # Token counts and model are now persisted by the agent directly.
-            # Keep only last_prompt_tokens here for context-window tracking and
-            # compression decisions.
+            # Mirror absolute usage totals into the gateway session entry so
+            # /usage works even after the in-memory agent is gone.
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+            )
+            self.session_store.append_usage_events(
+                session_entry.session_key,
+                agent_result.get("usage_events", []),
             )
 
             # Auto voice reply: send TTS audio before the text response
@@ -3530,6 +3534,7 @@ class GatewayRunner:
         current_base_url = ""
         current_api_key = ""
         user_provs = None
+        cfg = {}
         config_path = _hermes_home / "config.yaml"
         try:
             if config_path.exists():
@@ -3543,6 +3548,64 @@ class GatewayRunner:
                 user_provs = cfg.get("providers")
         except Exception:
             pass
+
+        def _resolve_config_model_limits(model_name: str, base_url: str) -> tuple[int | None, int | None]:
+            """Resolve context/max token overrides from config.yaml for display."""
+            ctx_val = None
+            max_val = None
+
+            model_cfg_local = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            if isinstance(model_cfg_local, dict):
+                try:
+                    raw_ctx = model_cfg_local.get("context_length")
+                    if raw_ctx is not None:
+                        parsed_ctx = int(raw_ctx)
+                        if parsed_ctx > 0:
+                            ctx_val = parsed_ctx
+                except Exception:
+                    pass
+                try:
+                    raw_max = model_cfg_local.get("max_tokens")
+                    if raw_max is not None:
+                        parsed_max = int(raw_max)
+                        if parsed_max > 0:
+                            max_val = parsed_max
+                except Exception:
+                    pass
+
+            target_base = (base_url or "").rstrip("/")
+            custom_providers = cfg.get("custom_providers", []) if isinstance(cfg, dict) else []
+            if isinstance(custom_providers, list) and target_base:
+                for entry in custom_providers:
+                    if not isinstance(entry, dict):
+                        continue
+                    if (entry.get("base_url") or "").rstrip("/") != target_base:
+                        continue
+                    models_cfg = entry.get("models", {})
+                    if not isinstance(models_cfg, dict):
+                        break
+                    model_limits = models_cfg.get(model_name, {})
+                    if not isinstance(model_limits, dict):
+                        break
+                    try:
+                        raw_ctx = model_limits.get("context_length")
+                        if raw_ctx is not None:
+                            parsed_ctx = int(raw_ctx)
+                            if parsed_ctx > 0:
+                                ctx_val = parsed_ctx
+                    except Exception:
+                        pass
+                    try:
+                        raw_max = model_limits.get("max_tokens")
+                        if raw_max is not None:
+                            parsed_max = int(raw_max)
+                            if parsed_max > 0:
+                                max_val = parsed_max
+                    except Exception:
+                        pass
+                    break
+
+            return ctx_val, max_val
 
         # Check for session override
         source = event.source
@@ -3649,6 +3712,36 @@ class GatewayRunner:
                             if mi.has_cost_data():
                                 lines.append(f"Cost: {mi.format_cost()}")
                             lines.append(f"Capabilities: {mi.format_capabilities()}")
+                        else:
+                            try:
+                                from agent.model_metadata import (
+                                    get_model_context_length,
+                                    get_model_max_output_tokens,
+                                )
+                                _meta_base_url = result.base_url or current_base_url
+                                _meta_api_key = result.api_key or current_api_key
+                                _cfg_ctx, _cfg_max = _resolve_config_model_limits(
+                                    result.new_model, _meta_base_url
+                                )
+                                ctx = get_model_context_length(
+                                    result.new_model,
+                                    base_url=_meta_base_url,
+                                    api_key=_meta_api_key,
+                                    config_context_length=_cfg_ctx,
+                                    provider=result.target_provider,
+                                )
+                                lines.append(f"Context: {ctx:,} tokens")
+                                max_out = get_model_max_output_tokens(
+                                    result.new_model,
+                                    base_url=_meta_base_url,
+                                    api_key=_meta_api_key,
+                                    config_max_tokens=_cfg_max,
+                                    provider=result.target_provider,
+                                )
+                                if isinstance(max_out, int) and max_out > 0:
+                                    lines.append(f"Max output: {max_out:,} tokens")
+                            except Exception:
+                                pass
                         lines.append("_(session only — use `/model <name> --global` to persist)_")
                         return "\n".join(lines)
 
@@ -3783,14 +3876,32 @@ class GatewayRunner:
             lines.append(f"Capabilities: {mi.format_capabilities()}")
         else:
             try:
-                from agent.model_metadata import get_model_context_length
+                from agent.model_metadata import (
+                    get_model_context_length,
+                    get_model_max_output_tokens,
+                )
+                _meta_base_url = result.base_url or current_base_url
+                _meta_api_key = result.api_key or current_api_key
+                _cfg_ctx, _cfg_max = _resolve_config_model_limits(
+                    result.new_model, _meta_base_url
+                )
                 ctx = get_model_context_length(
                     result.new_model,
-                    base_url=result.base_url or current_base_url,
-                    api_key=result.api_key or current_api_key,
+                    base_url=_meta_base_url,
+                    api_key=_meta_api_key,
+                    config_context_length=_cfg_ctx,
                     provider=result.target_provider,
                 )
                 lines.append(f"Context: {ctx:,} tokens")
+                max_out = get_model_max_output_tokens(
+                    result.new_model,
+                    base_url=_meta_base_url,
+                    api_key=_meta_api_key,
+                    config_max_tokens=_cfg_max,
+                    provider=result.target_provider,
+                )
+                if isinstance(max_out, int) and max_out > 0:
+                    lines.append(f"Max output: {max_out:,} tokens")
             except Exception:
                 pass
 
@@ -5258,19 +5369,32 @@ class GatewayRunner:
         )
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
-        """Handle /usage command -- show token usage for the session's last agent run."""
+        """Handle /usage command -- show provider-billed usage for the current session."""
         source = event.source
         session_key = self._session_key_for_source(source)
 
         agent = self._running_agents.get(session_key)
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
+            last_event = getattr(agent, "_last_usage_event", None) or {}
             lines = [
-                "📊 **Session Token Usage**",
+                "📊 **Provider-Billed Usage**",
+                "Session cumulative:",
                 f"Prompt (input): {agent.session_prompt_tokens:,}",
                 f"Completion (output): {agent.session_completion_tokens:,}",
+                f"Cache read tokens: {getattr(agent, 'session_cache_read_tokens', 0):,}",
+                f"Cache write tokens: {getattr(agent, 'session_cache_write_tokens', 0):,}",
                 f"Total: {agent.session_total_tokens:,}",
                 f"API calls: {agent.session_api_calls}",
             ]
+            if last_event:
+                lines.extend([
+                    "Last provider-billed call:",
+                    f"Prompt (input): {int(last_event.get('prompt_tokens', 0) or 0):,}",
+                    f"Completion (output): {int(last_event.get('completion_tokens', 0) or 0):,}",
+                    f"Cache read tokens: {int(last_event.get('cache_read_tokens', 0) or 0):,}",
+                    f"Cache write tokens: {int(last_event.get('cache_write_tokens', 0) or 0):,}",
+                    f"Total: {int(last_event.get('total_tokens', 0) or 0):,}",
+                ])
             ctx = agent.context_compressor
             if ctx.last_prompt_tokens:
                 pct = min(100, ctx.last_prompt_tokens / ctx.context_length * 100) if ctx.context_length else 0
@@ -5281,6 +5405,34 @@ class GatewayRunner:
 
         # No running agent -- check session history for a rough count
         session_entry = self.session_store.get_or_create_session(source)
+        if session_entry.total_tokens > 0:
+            last_event = session_entry.usage_events[-1] if session_entry.usage_events else {}
+            lines = [
+                "📊 **Provider-Billed Usage**",
+                "Session cumulative:",
+                f"Prompt (input): {session_entry.input_tokens:,}",
+                f"Completion (output): {session_entry.output_tokens:,}",
+                f"Cache read tokens: {session_entry.cache_read_tokens:,}",
+                f"Cache write tokens: {session_entry.cache_write_tokens:,}",
+                f"Total: {session_entry.total_tokens:,}",
+            ]
+            if last_event:
+                lines.extend([
+                    "Last provider-billed call:",
+                    f"Prompt (input): {int(last_event.get('prompt_tokens', 0) or 0):,}",
+                    f"Completion (output): {int(last_event.get('completion_tokens', 0) or 0):,}",
+                    f"Cache read tokens: {int(last_event.get('cache_read_tokens', 0) or 0):,}",
+                    f"Cache write tokens: {int(last_event.get('cache_write_tokens', 0) or 0):,}",
+                    f"Total: {int(last_event.get('total_tokens', 0) or 0):,}",
+                ])
+            if session_entry.last_prompt_tokens:
+                lines.append(f"Last prompt tokens: {session_entry.last_prompt_tokens:,}")
+            if session_entry.estimated_cost_usd > 0:
+                lines.append(f"Estimated cost: ${session_entry.estimated_cost_usd:.6f}")
+            if session_entry.cost_status and session_entry.cost_status != "unknown":
+                lines.append(f"Cost status: {session_entry.cost_status}")
+            return "\n".join(lines)
+
         history = self.session_store.load_transcript(session_entry.session_id)
         if history:
             from agent.model_metadata import estimate_messages_tokens_rough
@@ -6893,11 +7045,21 @@ class GatewayRunner:
             _last_prompt_toks = 0
             _input_toks = 0
             _output_toks = 0
+            _cache_read_toks = 0
+            _cache_write_toks = 0
+            _total_toks = 0
+            _estimated_cost_usd = 0.0
+            _cost_status = "unknown"
             _agent = agent_holder[0]
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
+                _cache_read_toks = getattr(_agent, "session_cache_read_tokens", 0)
+                _cache_write_toks = getattr(_agent, "session_cache_write_tokens", 0)
+                _total_toks = getattr(_agent, "session_total_tokens", 0)
+                _estimated_cost_usd = getattr(_agent, "session_estimated_cost_usd", 0.0)
+                _cost_status = getattr(_agent, "session_cost_status", "unknown")
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
@@ -6911,6 +7073,13 @@ class GatewayRunner:
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
+                    "cache_read_tokens": _cache_read_toks,
+                    "cache_write_tokens": _cache_write_toks,
+                    "total_tokens": _total_toks,
+                    "estimated_cost_usd": _estimated_cost_usd,
+                    "cost_status": _cost_status,
+                    "usage_events": result.get("usage_events", []),
+                    "last_usage_event": result.get("last_usage_event"),
                     "model": _resolved_model,
                 }
             
@@ -7000,6 +7169,13 @@ class GatewayRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "cache_read_tokens": _cache_read_toks,
+                "cache_write_tokens": _cache_write_toks,
+                "total_tokens": _total_toks,
+                "estimated_cost_usd": _estimated_cost_usd,
+                "cost_status": _cost_status,
+                "usage_events": result.get("usage_events", []),
+                "last_usage_event": result.get("last_usage_event"),
                 "model": _resolved_model,
                 "session_id": effective_session_id,
             }

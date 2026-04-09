@@ -26,6 +26,7 @@ from agent.model_metadata import (
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
     get_model_context_length,
+    get_model_max_output_tokens,
     get_next_probe_tier,
     get_cached_context_length,
     parse_context_limit_from_error,
@@ -633,3 +634,46 @@ class TestContextLengthCache:
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
             save_context_length(model, url, 200000)
             assert get_cached_context_length(model, url) == 200000
+
+
+# =========================================================================
+# Max output tokens lookup
+# =========================================================================
+
+class TestGetModelMaxOutputTokens:
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_openrouter_metadata(self, mock_fetch):
+        mock_fetch.return_value = {
+            "google/gemma-4-31b-it:free": {"max_completion_tokens": 65536}
+        }
+        assert get_model_max_output_tokens("google/gemma-4-31b-it:free") == 65536
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_custom_endpoint_metadata(self, mock_endpoint_fetch, mock_fetch):
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {
+            "unsloth/gemma-4-26b-a4b-it": {"max_completion_tokens": 8192}
+        }
+        result = get_model_max_output_tokens(
+            "unsloth/gemma-4-26b-a4b-it",
+            base_url="http://192.168.123.188:11234/v1",
+        )
+        assert result == 8192
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    @patch("agent.models_dev.get_model_info")
+    def test_models_dev_provider_aware(self, mock_get_model_info, mock_endpoint_fetch, mock_fetch):
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+        mock_get_model_info.return_value = MagicMock(max_output=32768)
+        result = get_model_max_output_tokens(
+            "gemini/gemini-3-flash-preview",
+            provider="litellm",
+            base_url="http://192.168.123.208:4000/v1",
+        )
+        assert result == 32768
+
+    def test_config_override_wins(self):
+        assert get_model_max_output_tokens("any/model", config_max_tokens=4096) == 4096

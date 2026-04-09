@@ -151,6 +151,52 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
         session_entry.session_key,
         last_prompt_tokens=80,
     )
+    runner.session_store.append_usage_events.assert_called_once_with(
+        session_entry.session_key,
+        [],
+    )
+
+
+@pytest.mark.asyncio
+async def test_usage_command_reports_provider_billed_cumulative_and_last_call():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        input_tokens=662808,
+        output_tokens=4952,
+        cache_read_tokens=67840,
+        cache_write_tokens=0,
+        total_tokens=667760,
+        last_prompt_tokens=54234,
+        cost_status="included",
+        usage_events=[
+            {
+                "prompt_tokens": 81234,
+                "completion_tokens": 410,
+                "cache_read_tokens": 12456,
+                "cache_write_tokens": 0,
+                "total_tokens": 81644,
+            }
+        ],
+    )
+    runner = _make_runner(session_entry)
+
+    result = await runner._handle_usage_command(_make_event("/usage"))
+
+    assert "Provider-Billed Usage" in result
+    assert "Session cumulative:" in result
+    assert "Prompt (input): 662,808" in result
+    assert "Completion (output): 4,952" in result
+    assert "Cache read tokens: 67,840" in result
+    assert "Total: 667,760" in result
+    assert "Last provider-billed call:" in result
+    assert "Prompt (input): 81,234" in result
+    assert "Last prompt tokens: 54,234" in result
+    assert "Cost status: included" in result
 
 
 

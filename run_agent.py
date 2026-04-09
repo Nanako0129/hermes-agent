@@ -107,6 +107,159 @@ from agent.trajectory import (
 from utils import atomic_json_write, env_var_enabled
 
 
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    """Return a positive int when possible, else None."""
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        parsed = int(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _resolve_config_model_max_tokens(
+    config: Dict[str, Any],
+    model: str,
+    base_url: str,
+) -> Optional[int]:
+    """Resolve model max_tokens override from config.yaml."""
+    if not isinstance(config, dict):
+        return None
+
+    model_cfg = config.get("model", {})
+    resolved = None
+    if isinstance(model_cfg, dict):
+        resolved = _coerce_positive_int(model_cfg.get("max_tokens"))
+
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, list):
+        target_url = (base_url or "").rstrip("/")
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            cp_url = (entry.get("base_url") or "").rstrip("/")
+            if cp_url != target_url:
+                continue
+            cp_models = entry.get("models", {})
+            if not isinstance(cp_models, dict):
+                break
+            cp_model_cfg = cp_models.get(model, {})
+            if not isinstance(cp_model_cfg, dict):
+                break
+            cp_max = _coerce_positive_int(cp_model_cfg.get("max_tokens"))
+            if cp_max is not None:
+                resolved = cp_max
+            break
+
+    return resolved
+
+
+def _deep_merge_dicts(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a deep merge of two dicts where overlay wins on conflicts."""
+    merged: Dict[str, Any] = dict(base or {})
+    for key, value in (overlay or {}).items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_dicts(existing, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_config_extra_body(
+    config: Dict[str, Any],
+    *,
+    provider: str,
+    base_url: str,
+    model: str,
+) -> Dict[str, Any]:
+    """Resolve extra_body overrides from config.yaml.
+
+    Priority:
+    1. model.extra_body (global)
+    2. custom_providers entry matching provider name or base_url
+    3. custom_providers[].models[model].extra_body
+    """
+    if not isinstance(config, dict):
+        return {}
+
+    resolved: Dict[str, Any] = {}
+    model_cfg = config.get("model", {})
+    if isinstance(model_cfg, dict) and isinstance(model_cfg.get("extra_body"), dict):
+        resolved = _deep_merge_dicts(resolved, model_cfg["extra_body"])
+
+    custom_providers = config.get("custom_providers")
+    if not isinstance(custom_providers, list):
+        return resolved
+
+    provider_norm = (provider or "").strip().lower()
+    target_url = (base_url or "").rstrip("/")
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_name = (entry.get("name") or "").strip().lower()
+        entry_url = (entry.get("base_url") or "").rstrip("/")
+
+        matches_provider = provider_norm and entry_name == provider_norm
+        matches_base_url = target_url and entry_url == target_url
+        if not (matches_provider or matches_base_url):
+            continue
+
+        entry_extra = entry.get("extra_body")
+        if isinstance(entry_extra, dict):
+            resolved = _deep_merge_dicts(resolved, entry_extra)
+
+        cp_models = entry.get("models", {})
+        if isinstance(cp_models, dict):
+            model_cfg = cp_models.get(model, {})
+            if isinstance(model_cfg, dict) and isinstance(model_cfg.get("extra_body"), dict):
+                resolved = _deep_merge_dicts(resolved, model_cfg["extra_body"])
+        break
+
+    return resolved
+
+
+def _prompt_caching_source(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    api_mode: str,
+) -> Optional[str]:
+    """Return the active prompt caching source for this route, if any."""
+    model_lower = (model or "").lower()
+    base_url_lower = (base_url or "").lower()
+    provider_lower = (provider or "").strip().lower()
+
+    if api_mode == "anthropic_messages":
+        return "native_anthropic"
+    if "openrouter" in base_url_lower and "claude" in model_lower:
+        return "openrouter_claude"
+    if provider_lower == "litellm" and model_lower.startswith("gemini/"):
+        return "litellm_gemini"
+    return None
+
+
+def _is_chatgpt_codex_backend(base_url: str) -> bool:
+    """Return True for the ChatGPT Codex backend-api endpoint."""
+    normalized = (base_url or "").strip().lower().rstrip("/")
+    return "chatgpt.com/backend-api/codex" in normalized
+
+
+def _is_direct_openai_responses_base_url(base_url: str) -> bool:
+    """Return True for direct OpenAI/Azure Responses hosts that support cache params."""
+    normalized = (base_url or "").strip().lower().rstrip("/")
+    if not normalized:
+        return True
+    if "api.openai.com" in normalized:
+        return True
+    if ".openai.azure.com/openai" in normalized:
+        return True
+    return False
+
+
 
 class _SafeWriter:
     """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
@@ -630,16 +783,19 @@ class AIAgent:
         
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
+        self._explicit_max_tokens = max_tokens is not None
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
-        is_openrouter = self._is_openrouter_url()
-        is_claude = "claude" in self.model.lower()
-        is_native_anthropic = self.api_mode == "anthropic_messages"
-        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
+        # Prompt caching: supported for native Anthropic, Claude via OpenRouter,
+        # and Gemini routed through LiteLLM (translated to Google's context cache).
+        self._prompt_caching_source = _prompt_caching_source(
+            provider=self.provider,
+            model=self.model,
+            base_url=self.base_url,
+            api_mode=self.api_mode,
+        )
+        self._use_prompt_caching = self._prompt_caching_source is not None
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
         
         # Iteration budget pressure: warn the LLM as it approaches max_iterations.
@@ -893,8 +1049,12 @@ class AIAgent:
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
-            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
-            print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
+            source_labels = {
+                "native_anthropic": "native Anthropic",
+                "openrouter_claude": "Claude via OpenRouter",
+                "litellm_gemini": "Gemini via LiteLLM",
+            }
+            print(f"💾 Prompt caching: ENABLED ({source_labels.get(self._prompt_caching_source, 'supported route')}, {self._cache_ttl} TTL)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
         self.session_start = datetime.now()
@@ -965,6 +1125,7 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+        self._agent_cfg = _agent_cfg if isinstance(_agent_cfg, dict) else {}
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1128,6 +1289,21 @@ class AIAgent:
                                     except (TypeError, ValueError):
                                         pass
                         break
+
+        # Read max_tokens override from config when caller did not pass one.
+        if not self._explicit_max_tokens:
+            _config_max_tokens = _resolve_config_model_max_tokens(
+                _agent_cfg,
+                model=self.model,
+                base_url=self.base_url,
+            )
+            if _config_max_tokens is not None:
+                self.max_tokens = _config_max_tokens
+                logger.info(
+                    "Using model.max_tokens override: %s tokens for %s",
+                    f"{_config_max_tokens:,}",
+                    self.model,
+                )
         
         self.context_compressor = ContextCompressor(
             model=self.model,
@@ -1161,6 +1337,9 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self.session_usage_events: List[Dict[str, Any]] = []
+        self._current_turn_usage_events: List[Dict[str, Any]] = []
+        self._last_usage_event: Optional[Dict[str, Any]] = None
         
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -1254,6 +1433,9 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self.session_usage_events = []
+        self._current_turn_usage_events = []
+        self._last_usage_event = None
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
@@ -1301,6 +1483,21 @@ class AIAgent:
         if api_key:
             self.api_key = api_key
 
+        # Re-resolve config-driven max_tokens for the new model when the
+        # agent was not started with an explicit max_tokens argument.
+        if not getattr(self, "_explicit_max_tokens", False):
+            try:
+                from hermes_cli.config import load_config as _load_agent_config
+
+                _switch_cfg = _load_agent_config()
+            except Exception:
+                _switch_cfg = {}
+            self.max_tokens = _resolve_config_model_max_tokens(
+                _switch_cfg,
+                model=self.model,
+                base_url=self.base_url,
+            )
+
         # ── Build new client ──
         if api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
@@ -1332,11 +1529,13 @@ class AIAgent:
             )
 
         # ── Re-evaluate prompt caching ──
-        is_native_anthropic = api_mode == "anthropic_messages"
-        self._use_prompt_caching = (
-            ("openrouter" in (self.base_url or "").lower() and "claude" in new_model.lower())
-            or is_native_anthropic
+        self._prompt_caching_source = _prompt_caching_source(
+            provider=self.provider,
+            model=self.model,
+            base_url=self.base_url,
+            api_mode=api_mode,
         )
+        self._use_prompt_caching = self._prompt_caching_source is not None
 
         # ── Update context compressor ──
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -2289,6 +2488,30 @@ class AIAgent:
         summary["prompt_tokens"] = cu.prompt_tokens
         summary["total_tokens"] = cu.total_tokens
         return summary
+
+    def _build_usage_event(
+        self,
+        canonical_usage: Any,
+        *,
+        estimated_cost_usd: Optional[float],
+        cost_status: str,
+    ) -> Dict[str, Any]:
+        """Build a provider-billed request-level usage event."""
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "provider": self.provider,
+            "model": self.model,
+            "base_url": self.base_url,
+            "api_mode": self.api_mode,
+            "prompt_tokens": canonical_usage.prompt_tokens,
+            "completion_tokens": canonical_usage.output_tokens,
+            "cache_read_tokens": canonical_usage.cache_read_tokens,
+            "cache_write_tokens": canonical_usage.cache_write_tokens,
+            "reasoning_tokens": canonical_usage.reasoning_tokens,
+            "total_tokens": canonical_usage.total_tokens,
+            "estimated_cost_usd": float(estimated_cost_usd or 0.0),
+            "cost_status": cost_status or "unknown",
+        }
 
     def _dump_api_request_debug(
         self,
@@ -3249,6 +3472,7 @@ class AIAgent:
             "model", "instructions", "input", "tools", "store",
             "reasoning", "include", "max_output_tokens", "temperature",
             "tool_choice", "parallel_tool_calls", "prompt_cache_key",
+            "prompt_cache_retention",
         }
         normalized: Dict[str, Any] = {
             "model": model,
@@ -3275,8 +3499,13 @@ class AIAgent:
         if isinstance(temperature, (int, float)):
             normalized["temperature"] = float(temperature)
 
-        # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
-        for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
+        # Pass through Responses API controls that Hermes manages directly.
+        for passthrough_key in (
+            "tool_choice",
+            "parallel_tool_calls",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+        ):
             val = api_kwargs.get(passthrough_key)
             if val is not None:
                 normalized[passthrough_key] = val
@@ -4885,11 +5114,13 @@ class AIAgent:
                 }
 
             # Re-evaluate prompt caching for the new provider/model
-            is_native_anthropic = fb_api_mode == "anthropic_messages"
-            self._use_prompt_caching = (
-                ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
-                or is_native_anthropic
+            self._prompt_caching_source = _prompt_caching_source(
+                provider=self.provider,
+                model=self.model,
+                base_url=fb_base_url,
+                api_mode=fb_api_mode,
             )
+            self._use_prompt_caching = self._prompt_caching_source is not None
 
             # Update context compressor limits for the fallback model.
             # Without this, compression decisions use the primary model's
@@ -5259,6 +5490,8 @@ class AIAgent:
                 "models.github.ai" in self.base_url.lower()
                 or "api.githubcopilot.com" in self.base_url.lower()
             )
+            is_chatgpt_codex_backend = _is_chatgpt_codex_backend(self.base_url)
+            is_direct_openai_responses = _is_direct_openai_responses_base_url(self.base_url)
 
             # Resolve reasoning effort: config > default (medium)
             reasoning_effort = "medium"
@@ -5279,8 +5512,13 @@ class AIAgent:
                 "store": False,
             }
 
-            if not is_github_responses:
+            if not is_github_responses and is_direct_openai_responses:
                 kwargs["prompt_cache_key"] = self.session_id
+                if os.getenv("HERMES_CODEX_PROMPT_CACHE_RETENTION", "").strip():
+                    kwargs["prompt_cache_retention"] = os.getenv(
+                        "HERMES_CODEX_PROMPT_CACHE_RETENTION",
+                        "24h",
+                    )
 
             if reasoning_enabled:
                 if is_github_responses:
@@ -5296,7 +5534,7 @@ class AIAgent:
             elif not is_github_responses:
                 kwargs["include"] = []
 
-            if self.max_tokens is not None:
+            if self.max_tokens is not None and not is_chatgpt_codex_backend:
                 kwargs["max_output_tokens"] = self.max_tokens
 
             return kwargs
@@ -5437,6 +5675,16 @@ class AIAgent:
             options = extra_body.get("options", {})
             options["num_ctx"] = self._ollama_num_ctx
             extra_body["options"] = options
+
+        configured_extra_body = _resolve_config_extra_body(
+            self._agent_cfg,
+            provider=self.provider,
+            base_url=self.base_url,
+            model=self.model,
+        )
+        if configured_extra_body:
+            # Built-in provider/runtime fields win over config collisions.
+            extra_body = _deep_merge_dicts(configured_extra_body, extra_body)
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
@@ -6913,6 +7161,7 @@ class AIAgent:
         
         # Track user turns for memory flush and periodic nudge logic
         self._user_turn_count += 1
+        self._current_turn_usage_events = []
 
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
@@ -7235,10 +7484,8 @@ class AIAgent:
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
-            # Apply Anthropic prompt caching for Claude models via OpenRouter.
-            # Auto-detected: if model name contains "claude" and base_url is OpenRouter,
-            # inject cache_control breakpoints (system + last 3 messages) to reduce
-            # input token costs by ~75% on multi-turn conversations.
+            # Apply cache_control breakpoints for supported routes:
+            # native Anthropic, Claude via OpenRouter, and Gemini via LiteLLM.
             if self._use_prompt_caching:
                 api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
 
@@ -7733,6 +7980,14 @@ class AIAgent:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+                        usage_event = self._build_usage_event(
+                            canonical_usage,
+                            estimated_cost_usd=cost_result.amount_usd,
+                            cost_status=cost_result.status,
+                        )
+                        self.session_usage_events.append(usage_event)
+                        self._current_turn_usage_events.append(usage_event)
+                        self._last_usage_event = usage_event
 
                         # Persist token counts to session DB for /insights.
                         # Do this for every platform with a session_id so non-CLI
@@ -7766,17 +8021,12 @@ class AIAgent:
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                         
-                        # Log cache hit stats when prompt caching is active
-                        if self._use_prompt_caching:
-                            if self.api_mode == "anthropic_messages":
-                                # Anthropic uses cache_read_input_tokens / cache_creation_input_tokens
-                                cached = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
-                                written = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
-                            else:
-                                # OpenRouter uses prompt_tokens_details.cached_tokens
-                                details = getattr(response.usage, 'prompt_tokens_details', None)
-                                cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
-                                written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
+                        # Cache accounting should come from normalized usage payloads,
+                        # not route-specific header guesses. This keeps Responses API
+                        # and chat-completions providers aligned.
+                        cached = canonical_usage.cache_read_tokens or 0
+                        written = canonical_usage.cache_write_tokens or 0
+                        if self._use_prompt_caching or cached or written:
                             prompt = usage_dict["prompt_tokens"]
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
@@ -9130,6 +9380,8 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "usage_events": list(self._current_turn_usage_events),
+            "last_usage_event": copy.deepcopy(self._last_usage_event),
         }
         self._response_was_previewed = False
         

@@ -960,6 +960,54 @@ class TestLastPromptTokens:
         store.update_session("k1", last_prompt_tokens=0)
         assert entry.last_prompt_tokens == 0
 
+    def test_append_usage_events_recomputes_cumulative_totals(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="k1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        store._entries = {"k1": entry}
+
+        store.append_usage_events("k1", [
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "cache_read_tokens": 10,
+                "cache_write_tokens": 0,
+                "total_tokens": 120,
+                "estimated_cost_usd": 0.001,
+                "cost_status": "estimated",
+            },
+            {
+                "prompt_tokens": 70,
+                "completion_tokens": 5,
+                "cache_read_tokens": 15,
+                "cache_write_tokens": 3,
+                "total_tokens": 75,
+                "estimated_cost_usd": 0.0025,
+                "cost_status": "included",
+            },
+        ])
+
+        assert len(entry.usage_events) == 2
+        assert entry.input_tokens == 170
+        assert entry.output_tokens == 25
+        assert entry.cache_read_tokens == 25
+        assert entry.cache_write_tokens == 3
+        assert entry.total_tokens == 195
+        assert entry.estimated_cost_usd == 0.0035
+        assert entry.cost_status == "included"
+
 class TestRewriteTranscriptPreservesReasoning:
     """rewrite_transcript must not drop reasoning fields from SQLite."""
 

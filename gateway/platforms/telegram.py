@@ -1859,6 +1859,9 @@ class TelegramAdapter(BasePlatformAdapter):
             text,
         )
 
+        # 8) Strip Discord custom emoji tags <:name:id> for Telegram compatibility
+        text = re.sub(r'<:[a-zA-Z0-9_]+:[0-9]+>', '', text)
+
         # 8) Convert spoiler: ||text|| → ||text|| (protect from | escaping)
         text = re.sub(
             r'\|\|(.+?)\|\|',

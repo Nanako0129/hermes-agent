@@ -17,7 +17,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -368,6 +368,7 @@ class SessionEntry:
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
     cost_status: str = "unknown"
+    usage_events: List[Dict[str, Any]] = field(default_factory=list)
     
     # Last API-reported prompt tokens (for accurate compression pre-check)
     last_prompt_tokens: int = 0
@@ -401,6 +402,7 @@ class SessionEntry:
             "last_prompt_tokens": self.last_prompt_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
+            "usage_events": self.usage_events,
             "memory_flushed": self.memory_flushed,
         }
         if self.origin:
@@ -437,6 +439,7 @@ class SessionEntry:
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
+            usage_events=data.get("usage_events", []) or [],
             memory_flushed=data.get("memory_flushed", False),
         )
 
@@ -810,6 +813,13 @@ class SessionStore:
         self,
         session_key: str,
         last_prompt_tokens: int = None,
+        input_tokens: int = None,
+        output_tokens: int = None,
+        cache_read_tokens: int = None,
+        cache_write_tokens: int = None,
+        total_tokens: int = None,
+        estimated_cost_usd: float = None,
+        cost_status: str = None,
     ) -> None:
         """Update lightweight session metadata after an interaction."""
         with self._lock:
@@ -820,7 +830,75 @@ class SessionStore:
                 entry.updated_at = _now()
                 if last_prompt_tokens is not None:
                     entry.last_prompt_tokens = last_prompt_tokens
+                if input_tokens is not None:
+                    entry.input_tokens = int(input_tokens)
+                if output_tokens is not None:
+                    entry.output_tokens = int(output_tokens)
+                if cache_read_tokens is not None:
+                    entry.cache_read_tokens = int(cache_read_tokens)
+                if cache_write_tokens is not None:
+                    entry.cache_write_tokens = int(cache_write_tokens)
+                if total_tokens is not None:
+                    entry.total_tokens = int(total_tokens)
+                if estimated_cost_usd is not None:
+                    entry.estimated_cost_usd = float(estimated_cost_usd)
+                if cost_status is not None:
+                    entry.cost_status = str(cost_status)
                 self._save()
+
+    def append_usage_events(self, session_key: str, usage_events: List[Dict[str, Any]]) -> None:
+        """Append provider-billed per-request usage events and recompute totals."""
+        if not usage_events:
+            return
+        with self._lock:
+            self._ensure_loaded_locked()
+
+            entry = self._entries.get(session_key)
+            if not entry:
+                return
+
+            normalized_events: List[Dict[str, Any]] = []
+            for raw in usage_events:
+                if not isinstance(raw, dict):
+                    continue
+                normalized_events.append({
+                    "timestamp": raw.get("timestamp"),
+                    "provider": raw.get("provider"),
+                    "model": raw.get("model"),
+                    "base_url": raw.get("base_url"),
+                    "api_mode": raw.get("api_mode"),
+                    "prompt_tokens": int(raw.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int(raw.get("completion_tokens", 0) or 0),
+                    "cache_read_tokens": int(raw.get("cache_read_tokens", 0) or 0),
+                    "cache_write_tokens": int(raw.get("cache_write_tokens", 0) or 0),
+                    "total_tokens": int(raw.get("total_tokens", 0) or 0),
+                    "reasoning_tokens": int(raw.get("reasoning_tokens", 0) or 0),
+                    "estimated_cost_usd": float(raw.get("estimated_cost_usd", 0.0) or 0.0),
+                    "cost_status": str(raw.get("cost_status", "unknown") or "unknown"),
+                })
+
+            if not normalized_events:
+                return
+
+            entry.usage_events.extend(normalized_events)
+            if len(entry.usage_events) > 500:
+                entry.usage_events = entry.usage_events[-500:]
+
+            entry.input_tokens = sum(int(ev.get("prompt_tokens", 0) or 0) for ev in entry.usage_events)
+            entry.output_tokens = sum(int(ev.get("completion_tokens", 0) or 0) for ev in entry.usage_events)
+            entry.cache_read_tokens = sum(int(ev.get("cache_read_tokens", 0) or 0) for ev in entry.usage_events)
+            entry.cache_write_tokens = sum(int(ev.get("cache_write_tokens", 0) or 0) for ev in entry.usage_events)
+            entry.total_tokens = sum(int(ev.get("total_tokens", 0) or 0) for ev in entry.usage_events)
+            entry.estimated_cost_usd = sum(float(ev.get("estimated_cost_usd", 0.0) or 0.0) for ev in entry.usage_events)
+            last_status = next(
+                (str(ev.get("cost_status", "unknown") or "unknown") for ev in reversed(entry.usage_events)
+                 if str(ev.get("cost_status", "unknown") or "unknown") != "unknown"),
+                None,
+            )
+            if last_status is not None:
+                entry.cost_status = last_status
+            entry.updated_at = _now()
+            self._save()
 
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""

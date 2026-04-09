@@ -477,6 +477,42 @@ class TestInit:
             assert a.api_mode == "anthropic_messages"
             assert a._use_prompt_caching is True
 
+    def test_prompt_caching_litellm_gemini(self):
+        """Gemini via LiteLLM should enable prompt caching."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                provider="litellm",
+                model="gemini/gemini-3.1-flash-lite-preview",
+                base_url="http://192.168.123.208:4000/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._use_prompt_caching is True
+
+    def test_prompt_caching_litellm_non_gemini_disabled(self):
+        """LiteLLM routes should not enable cache_control for non-Gemini models."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                provider="litellm",
+                model="openai/gpt-4o",
+                base_url="http://192.168.123.208:4000/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._use_prompt_caching is False
+
     def test_valid_tool_names_populated(self):
         """valid_tool_names should contain names from loaded tools."""
         tools = _make_tool_defs("web_search", "terminal")
@@ -871,6 +907,29 @@ class TestBuildApiKwargs:
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["max_tokens"] == 4096
+
+    def test_custom_provider_extra_body_from_config(self, agent):
+        agent.provider = "litellm"
+        agent.base_url = "http://litellm.local/v1"
+        agent.model = "gemini/gemini-3.1-flash-lite-preview"
+        agent._agent_cfg = {
+            "custom_providers": [
+                {
+                    "name": "litellm",
+                    "base_url": "http://litellm.local/v1",
+                    "extra_body": {"cache": {"enabled": True, "ttl": 300}},
+                    "models": {
+                        "gemini/gemini-3.1-flash-lite-preview": {
+                            "extra_body": {"cache": {"strategy": "exact"}}
+                        }
+                    },
+                }
+            ]
+        }
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["extra_body"]["cache"]["enabled"] is True
+        assert kwargs["extra_body"]["cache"]["ttl"] == 300
+        assert kwargs["extra_body"]["cache"]["strategy"] == "exact"
 
 
 class TestBuildAssistantMessage:

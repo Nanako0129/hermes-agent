@@ -478,6 +478,22 @@ def resolve_provider_full(
         user_pdef = resolve_user_provider(name.strip().lower(), user_providers)
         if user_pdef is not None:
             return user_pdef
+    else:
+        # Fallback: if caller didn't pass providers (or config read failed),
+        # try loading config.yaml directly so custom providers still resolve.
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            cfg_providers = cfg.get("providers")
+            if isinstance(cfg_providers, dict):
+                user_pdef = resolve_user_provider(canonical, cfg_providers)
+                if user_pdef is not None:
+                    return user_pdef
+                user_pdef = resolve_user_provider(name.strip().lower(), cfg_providers)
+                if user_pdef is not None:
+                    return user_pdef
+        except Exception:
+            pass
 
     # 3. Try models.dev directly (for providers not in our ALIASES)
     try:

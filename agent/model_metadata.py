@@ -835,6 +835,25 @@ def _resolve_nous_context_length(model: str) -> Optional[int]:
     return None
 
 
+def _match_endpoint_metadata_entry(
+    endpoint_metadata: Dict[str, Dict[str, Any]],
+    model: str,
+) -> Optional[Dict[str, Any]]:
+    """Match a model entry from endpoint metadata with fuzzy fallback."""
+    matched = endpoint_metadata.get(model)
+    if not matched:
+        # Single-model servers: if only one model is loaded, use it.
+        if len(endpoint_metadata) == 1:
+            matched = next(iter(endpoint_metadata.values()))
+        else:
+            # Fuzzy match: substring in either direction.
+            for key, entry in endpoint_metadata.items():
+                if model in key or key in model:
+                    matched = entry
+                    break
+    return matched
+
+
 def get_model_context_length(
     model: str,
     base_url: str = "",
@@ -878,17 +897,7 @@ def get_model_context_length(
     # has the correct per-provider values and is checked at step 5+.
     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
         endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
-        matched = endpoint_metadata.get(model)
-        if not matched:
-            # Single-model servers: if only one model is loaded, use it
-            if len(endpoint_metadata) == 1:
-                matched = next(iter(endpoint_metadata.values()))
-            else:
-                # Fuzzy match: substring in either direction
-                for key, entry in endpoint_metadata.items():
-                    if model in key or key in model:
-                        matched = entry
-                        break
+        matched = _match_endpoint_metadata_entry(endpoint_metadata, model)
         if matched:
             context_length = matched.get("context_length")
             if isinstance(context_length, int):
@@ -963,6 +972,80 @@ def get_model_context_length(
 
     # 10. Default fallback — 128K
     return DEFAULT_FALLBACK_CONTEXT
+
+
+def get_model_max_output_tokens(
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+    config_max_tokens: int | None = None,
+    provider: str = "",
+) -> Optional[int]:
+    """Get max output tokens for a model.
+
+    Resolution order:
+    0. Explicit config override (model.max_tokens or per-endpoint model override)
+    1. Active endpoint metadata (/models for explicit custom endpoints)
+    2. Provider-aware models.dev metadata
+    3. OpenRouter live API metadata (top_provider.max_completion_tokens)
+    4. Anthropic fallback table for native Anthropic endpoints
+    5. Unknown (None)
+    """
+    # 0. Explicit config override — user knows best.
+    if config_max_tokens is not None:
+        coerced = _coerce_reasonable_int(config_max_tokens, minimum=1, maximum=10_000_000)
+        if coerced is not None:
+            return coerced
+
+    # Normalize provider-prefixed model names.
+    model = _strip_provider_prefix(model)
+
+    # 1. Endpoint metadata for explicit/custom endpoints.
+    if _is_custom_endpoint(base_url):
+        endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+        matched = _match_endpoint_metadata_entry(endpoint_metadata, model)
+        if matched:
+            max_completion_tokens = matched.get("max_completion_tokens")
+            if isinstance(max_completion_tokens, int) and max_completion_tokens > 0:
+                return max_completion_tokens
+
+    # 2. Provider-aware models.dev lookup.
+    effective_provider = provider
+    if not effective_provider or effective_provider in ("openrouter", "custom"):
+        if base_url:
+            inferred = _infer_provider_from_url(base_url)
+            if inferred:
+                effective_provider = inferred
+
+    if effective_provider:
+        try:
+            from agent.models_dev import get_model_info
+
+            model_info = get_model_info(effective_provider, model)
+            if model_info and isinstance(model_info.max_output, int) and model_info.max_output > 0:
+                return model_info.max_output
+        except Exception:
+            pass
+
+    # 3. OpenRouter live API metadata fallback.
+    metadata = fetch_model_metadata()
+    model_entry = metadata.get(model)
+    if isinstance(model_entry, dict):
+        max_completion_tokens = model_entry.get("max_completion_tokens")
+        if isinstance(max_completion_tokens, int) and max_completion_tokens > 0:
+            return max_completion_tokens
+
+    # 4. Anthropic fallback table (native endpoints).
+    if provider == "anthropic" or (base_url and "api.anthropic.com" in base_url):
+        try:
+            from agent.anthropic_adapter import _get_anthropic_max_output
+
+            return _get_anthropic_max_output(model)
+        except Exception:
+            pass
+
+    # 5. Unknown.
+    return None
 
 
 def estimate_tokens_rough(text: str) -> int:
